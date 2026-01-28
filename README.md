@@ -8,82 +8,111 @@
 - **Extension Maturity Classification:** Proposal
 - **Dependencies:**
   - [STAC API - Core](https://github.com/radiantearth/stac-api-spec/blob/main/core)
-  - [STAC Merkle Tree Specification](https://github.com/stacchain/merkle-tree)
+  - [RFC 8785: JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785)
 - **Owner**: @jonhealy1
 
 ## Introduction
 
-This extension adds a **Data Integrity Layer** to the STAC API. It enables users to cryptographically verify that the geospatial assets they retrieve have not been tampered with, corrupted (bit rot), or swapped since they were originally published.
+This extension adds a **Data Integrity Layer** to the STAC API. It enables users to cryptographically verify that geospatial assets have not been tampered with, corrupted (bit rot), or swapped since they were originally published.
 
-It introduces standard locations for **Merkle Roots** (at the Collection level) and **Inclusion Proofs** (at the Item level), along with a convenience endpoint for server-side verification.
+It defines the standard for advertising **Merkle Roots** (at the Collection level) and serving **Inclusion Proofs** (at the Item level).
 
-### The Trust Model
-In a standard STAC API, trust is **implied** ("I trust the URL I am visiting"). In a Merkle-enabled API, trust is **derived**:
-1.  **The Root:** A cryptographic commitment to the entire dataset state.
-2.  **The Proof:** A mathematical path linking a specific Item to that Root.
-3.  **The Asset:** The file itself, hashed and checked against the Item metadata.
+## Technical Implementation
 
-This architecture allows for **"Verify-then-Trust"** workflows, critical for high-assurance domains like Carbon Markets, Disaster Response, and Parametric Insurance.
+To ensure interoperability between different hashing implementations (e.g., Go, Python, Rust), strict adherence to canonicalization and hashing standards is required.
 
-## Endpoints
+### 1. Canonicalization (JCS)
+Before hashing any STAC Item, it MUST be transformed into its **Canonical Form** according to **[RFC 8785 (JSON Canonicalization Scheme)](https://www.rfc-editor.org/rfc/rfc8785)**.
+* This ensures keys are sorted and whitespace is removed.
+* **Exclusion:** When calculating the hash of a STAC Item, the `merkle:object_hash` field itself MUST be excluded from the input.
 
-This extension introduces a new utility endpoint to simplify verification for lightweight clients.
-
-| Method | URI | Description |
-| :--- | :--- | :--- |
-| `GET` | `/collections/{collectionId}/items/{itemId}/verify` | **Server-Side Verification.** Checks the integrity of a specific item against its collection's Merkle Root. |
+### 2. Hashing Algorithm
+* **Standard:** SHA-256 (defined in FIPS 180-4).
+* **Encoding:** All hashes MUST be represented as lowercase Hexadecimal strings.
+* **Double Hashing:** To prevent length-extension attacks, the construction `Hash(Leaf)` implies `SHA256(SHA256(Canonical_JSON_Bytes))`.
 
 ## Data Model Extensions
 
-To support verification, this extension mandates specific fields in the standard STAC API responses.
+### 1. Collection Object
+The Collection acts as the Anchor.
 
-### 1. Collection Object Extension
-The Collection metadata acts as the "Anchor of Truth."
+| Field | Type | Requirement | Description |
+| :--- | :--- | :--- | :--- |
+| `merkle:root` | `string` | **Required** | The Hex-encoded Merkle Root Hash of the current state of the collection. |
+| `merkle:root_method` | `string` | **Optional** | The hashing algorithm used. Allowed values: `sha256`. Defaults to `sha256` if omitted. |
+| `merkle:tree_height` | `integer` | **Recommended** | The height of the tree (number of levels). Useful for client-side pre-allocation. |
 
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `merkle:root` | `string` | **Required.** The Hex-encoded Merkle Root Hash of the entire collection. This is the value that should be anchored on a blockchain or public bulletin board. |
-| `merkle:root_method` | `string` | **Recommended.** The hashing algorithm used (e.g., `sha256`). Defaults to `sha256` if omitted. |
+### 2. Item Object
+The Item acts as the Leaf.
 
-### 2. Item Object Extension
-The Item metadata acts as the "Leaf" of the tree.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `merkle:object_hash` | `string` | **Required.** The hash of the canonical JSON representation of this Item (as calculated by the STAC Merkle CLI). |
+| Field | Type | Requirement | Description |
+| :--- | :--- | :--- | :--- |
+| `merkle:object_hash` | `string` | **Required** | The SHA-256 hash of this Item's canonical JCS representation. |
 
 ### 3. Link Relations
-The API must provide a way to retrieve the Proof file needed to connect the Item to the Root.
+| Relation | Description |
+| :--- | :--- |
+| `merkle-proof` | **Required.** Points to a JSON file containing the Merkle Inclusion Proof (siblings path). |
 
-- `rel="merkle-proof"`: **Required.** Points to a JSON file containing the Merkle Inclusion Proof (siblings path) for this specific item.
-- `rel="merkle-source"`: **Optional.** Points to the raw source data used to generate the hash, if different from the Item itself.
+## Merkle Proof Structure
 
-## Verification Behavior (`GET .../verify`)
+The resource pointed to by `rel="merkle-proof"` MUST adhere to the following JSON schema. This allows clients to verify the item without downloading the entire dataset.
 
-While clients *can* (and should) verify proofs locally using the fields above, the `/verify` endpoint provides a standardized way for the API to assert its own integrity.
+**Proof JSON Example:**
+```json
+{
+  "type": "MerkleProof",
+  "version": "1.0.0",
+  "leaf_hash": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
+  "root_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "index": 4,
+  "total_leaves": 15,
+  "siblings": [
+    {
+      "hash": "a1b2c3d4...",
+      "direction": "right"
+    },
+    {
+      "hash": "c5d6e7f8...",
+      "direction": "left"
+    },
+    {
+      "hash": "99887766...",
+      "direction": "left"
+    }
+  ]
+}
+```
 
-**Request:**
-`GET /collections/sentinel-2-l2a/items/S2A_tile_20240101/verify`
+**Verification Logic:**
+1.  Start with `current_hash = leaf_hash`.
+2.  Iterate through `siblings`.
+3.  If `direction` is "right": `current_hash = Hash(current_hash + sibling.hash)`.
+4.  If `direction` is "left": `current_hash = Hash(sibling.hash + current_hash)`.
+5.  Assert `current_hash == root_hash`.
 
-**Logic:**
-1.  **Fetch Item:** Retrieves the current item metadata from the database.
-2.  **Fetch Proof:** Retrieves the `merkle-proof` file (from S3/Storage).
-3.  **Calculate:**
-    * Computes `Hash(Item)`.
-    * Traverses the path in the Proof using the computed hash.
-    * Derives a candidate Root.
-4.  **Compare:** Checks if `Candidate Root == Collection.merkle:root`.
+## Lifecycle & Operational Guidance
 
-**Response (200 OK):**
-Returns a status object indicating the mathematical validity of the item.
+### Updating Roots (Dynamic Collections)
+Most STAC Collections are dynamic (new satellite imagery is added daily). The Merkle Root is a commitment to a **specific state** of the collection.
 
+* **Append-Only Strategy:** When new items are added, the Collection is considered to be in a new state. The `merkle:root` field in the Collection metadata MUST be updated to reflect the new global root.
+* **Proof Validity:** Adding items to a Merkle Tree changes the path for *existing* items. Therefore, **adding new items requires regenerating proofs for existing items.**
+    * *Note:* Implementers may choose to batch updates (e.g., "Daily Roots") to minimize regeneration costs.
+
+## Endpoints
+
+### `GET /collections/{id}/items/{id}/verify`
+This endpoint performs server-side verification.
+
+**Response:**
 ```json
 {
   "verified": true,
-  "item_id": "S2A_tile_20240101",
-  "merkle_root": "a1b2c3d4e5f6...",
-  "anchored_status": {
-    "on_chain": false,
-    "timestamp": "2024-01-28T12:00:00Z"
+  "timestamp": "2026-01-28T12:00:00Z",
+  "algorithm": "sha256",
+  "match_details": {
+    "item_hash_match": true,
+    "root_hash_match": true
   }
 }
